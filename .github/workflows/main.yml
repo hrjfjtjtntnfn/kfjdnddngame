@@ -1,0 +1,136 @@
+name: Full NRO Web + MySQL + phpMyAdmin + Cloudflared
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+env:
+  APACHE_PORT: 5000
+  MYSQL_ROOT_PASSWORD: root
+  ADMIN_USER: admin
+  ADMIN_PASS: 123456
+
+jobs:
+  setup:
+    name: Full Setup
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install required packages
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y mysql-server php php-mbstring php-zip php-gd php-json php-curl php-mysql unzip wget openssh-client apache2 libapache2-mod-php
+
+      - name: Stop MySQL if running
+        run: sudo systemctl stop mysql || true
+
+      - name: Start MySQL with skip-grant-tables
+        run: |
+          sudo mkdir -p /var/run/mysqld
+          sudo chown mysql:mysql /var/run/mysqld
+          sudo mysqld_safe --skip-grant-tables --skip-networking &
+          sleep 8
+
+      - name: Set MySQL root password
+        run: |
+          mysql -uroot <<SQL
+          FLUSH PRIVILEGES;
+          ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '${{ env.MYSQL_ROOT_PASSWORD }}';
+          FLUSH PRIVILEGES;
+          SQL
+          echo "✅ MySQL root password set"
+
+      - name: Restart MySQL normally
+        run: |
+          sudo pkill mysqld || true
+          sudo systemctl start mysql
+          sleep 5
+          mysql -uroot -p${{ env.MYSQL_ROOT_PASSWORD }} -e "SELECT VERSION();"
+          echo "✅ MySQL restarted"
+
+      - name: Create databases and import SQL
+        run: |
+          mysql -uroot -p${{ env.MYSQL_ROOT_PASSWORD }} -e "CREATE DATABASE IF NOT EXISTS nro_acc;"
+          [ -f ./nro_acc.sql ] && mysql -uroot -p${{ env.MYSQL_ROOT_PASSWORD }} nro_acc < ./nro_acc.sql || echo "⚠️ nro_acc.sql missing"
+          mysql -uroot -p${{ env.MYSQL_ROOT_PASSWORD }} -e "CREATE DATABASE IF NOT EXISTS nro_data;"
+          [ -f ./nro_data.sql ] && mysql -uroot -p${{ env.MYSQL_ROOT_PASSWORD }} nro_data < ./nro_data.sql || echo "⚠️ nro_data.sql missing"
+          echo "✅ Databases created and imported"
+
+      - name: Create admin user
+        run: |
+          mysql -uroot -p${{ env.MYSQL_ROOT_PASSWORD }} -e "CREATE USER IF NOT EXISTS '${{ env.ADMIN_USER }}'@'%' IDENTIFIED BY '${{ env.ADMIN_PASS }}';"
+          mysql -uroot -p${{ env.MYSQL_ROOT_PASSWORD }} -e "GRANT ALL PRIVILEGES ON *.* TO '${{ env.ADMIN_USER }}'@'%' WITH GRANT OPTION; FLUSH PRIVILEGES;"
+          echo "✅ Admin user created"
+
+      - name: Install phpMyAdmin (optional)
+        run: |
+          wget -q https://www.phpmyadmin.net/downloads/phpMyAdmin-latest-all-languages.zip -O pma.zip
+          unzip -q pma.zip
+          mv phpMyAdmin-* phpmyadmin || true
+          sudo php -S 0.0.0.0:8080 -t phpmyadmin &
+
+      - name: Install cloudflared
+        run: |
+          wget -q -O /usr/local/bin/cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          sudo chmod +x /usr/local/bin/cloudflared
+          cloudflared --version || true
+
+      - name: Start Cloudflared tunnel for phpMyAdmin
+        run: |
+          nohup cloudflared tunnel --url http://localhost:8080 --no-autoupdate > cloudflared.log 2>&1 &
+          sleep 8
+          grep -Eo 'https?://[^ ]+trycloudflare.com' cloudflared.log | head -n1 || echo "⚠️ phpMyAdmin URL not found"
+
+      - name: Download NRO release ZIP
+        run: |
+          wget -q https://github.com/hrjfjtjtntnfn/lode/releases/download/V.838383/new3.zip -O new3.zip
+          unzip -q new3.zip || true
+          [ -d "new3/new3" ] && mv new3/new3/* new3/
+          echo "✅ NRO files ready"
+
+      - name: Deploy web with Apache + .htaccess
+        run: |
+          sudo a2enmod rewrite || true
+          sudo systemctl stop apache2 || true
+
+          sudo mkdir -p /var/www/html
+          sudo cp -r new3/* /var/www/html/
+          sudo rm -f /var/www/html/index.html
+          sudo chown -R www-data:www-data /var/www/html
+          sudo chmod -R 755 /var/www/html
+
+          # Check .htaccess
+          [ -f /var/www/html/.htaccess ] || echo "⚠️ .htaccess missing"
+
+          # Configure Apache VirtualHost
+          sudo bash -c "cat >/etc/apache2/sites-available/000-default.conf <<EOF
+          <VirtualHost *:${{ env.APACHE_PORT }}>
+            DocumentRoot /var/www/html
+            <Directory /var/www/html>
+              AllowOverride All
+              Require all granted
+            </Directory>
+            ErrorLog \${APACHE_LOG_DIR}/error.log
+            CustomLog \${APACHE_LOG_DIR}/access.log combined
+          </VirtualHost>
+          EOF"
+
+          sudo sed -i "s/Listen 80/Listen ${{ env.APACHE_PORT }}/" /etc/apache2/ports.conf
+          sudo apachectl configtest || true
+
+          sudo systemctl start apache2
+          sleep 3
+          curl -I http://localhost:${{ env.APACHE_PORT }}
+
+      - name: Start Cloudflared tunnel for Apache
+        run: |
+          nohup cloudflared tunnel --url http://localhost:${{ env.APACHE_PORT }} --no-autoupdate > cloudflared.log 2>&1 &
+          sleep 10
+          grep -Eo 'https?://[^ ]+trycloudflare.com' cloudflared.log | head -n1 || echo "⚠️ Apache public URL not found"
+
+      - name: Keep runner alive
+        run: sleep 6000
